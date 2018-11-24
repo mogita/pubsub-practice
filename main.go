@@ -10,7 +10,37 @@ import (
 	"github.com/satori/go.uuid"
 )
 
-var serverAddress = ":8080"
+type User struct {
+	ID   string
+	conn *websocket.Conn
+}
+
+type Store struct {
+	Users []*User
+	sync.Mutex
+}
+
+type Message struct {
+	DeliveryID string `json:"id"`
+	Content    string `json:"content"`
+}
+
+var (
+	gStore      *Store
+	gPubSubConn *redis.PubSubConn
+	gRedisConn  = func() (redis.Conn, error) {
+		return redis.Dial("tcp", ":6379")
+	}
+
+	serverAddress = ":8080"
+	channelName   = "myChannel"
+)
+
+func init() {
+	gStore = &Store{
+		Users: make([]*User, 0, 1),
+	}
+}
 
 func main() {
 	gRedisConn, err := gRedisConn()
@@ -21,6 +51,9 @@ func main() {
 	defer gRedisConn.Close()
 
 	gPubSubConn = &redis.PubSubConn{Conn: gRedisConn}
+	if err := gPubSubConn.Subscribe(channelName); err != nil {
+		panic(err)
+	}
 
 	go deliverMessages()
 
@@ -56,37 +89,8 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 			log.Printf("error on redis conn. %s\n", err)
 		} else {
 			log.Printf("going to publish message %s\n", string(m.Content))
-			c.Do("PUBLISH", m.DeliveryID, string(m.Content))
+			c.Do("PUBLISH", channelName, string(m.Content))
 		}
-	}
-}
-
-type User struct {
-	ID   string
-	conn *websocket.Conn
-}
-
-type Store struct {
-	Users []*User
-	sync.Mutex
-}
-
-type Message struct {
-	DeliveryID string `json:"id"`
-	Content    string `json:"content"`
-}
-
-var (
-	gStore      *Store
-	gPubSubConn *redis.PubSubConn
-	gRedisConn  = func() (redis.Conn, error) {
-		return redis.Dial("tcp", ":6379")
-	}
-)
-
-func init() {
-	gStore = &Store{
-		Users: make([]*User, 0, 1),
 	}
 }
 
@@ -94,10 +98,6 @@ func (s *Store) newUser(conn *websocket.Conn) *User {
 	u := &User{
 		ID:   uuid.Must(uuid.NewV4()).String(),
 		conn: conn,
-	}
-
-	if err := gPubSubConn.Subscribe(u.ID); err != nil {
-		panic(err)
 	}
 
 	s.Lock()
@@ -111,12 +111,29 @@ func deliverMessages() {
 	for {
 		switch v := gPubSubConn.Receive().(type) {
 		case redis.Message:
-			gStore.findAndDeliver(v.Channel, string(v.Data))
+			// gStore.findAndDeliver(v.Channel, string(v.Data))
+			gStore.broadcast(string(v.Data))
 		case redis.Subscription:
 			log.Printf("subscription message: %s: %s %d\n", v.Channel, v.Kind, v.Count)
 		case error:
 			log.Println("error pub/sub, delivery has stopped")
 			return
+		default:
+			log.Printf("pubsub received")
+		}
+	}
+}
+
+func (s *Store) broadcast(content string) {
+	m := Message{
+		Content: content,
+	}
+
+	for _, u := range s.Users {
+		if err := u.conn.WriteJSON(m); err != nil {
+			log.Printf("error on message delivery e: %s\n", err)
+		} else {
+			log.Printf("message sent to user %s\n", u.ID)
 		}
 	}
 }
